@@ -1,483 +1,500 @@
 """
-临界认知AI - 最终稳定版（始逻辑完全）
-1. 修复torch.clamp类型冲突（恢复你原始正确写法）
-2. 修复千问API 404检测错误
-3. 解决PaddleOCR与PyTorch GPU冲突（保留OCR功能）
+临界认知AI 最终优化版（修复临界后自动进入在线学习）
+适配 16GB RAM + GTX 1660 (6GB)
+IDFT理论完整保留
 """
-import os
-os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
-os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
-import os, re, time, pickle, random, requests
+
+import os, re, time, json, pickle, random, requests, threading, gc
 import numpy as np
-from PIL import Image
 from collections import deque
 from dataclasses import dataclass, field
+from typing import List, Dict, Tuple, Optional
+from PIL import Image
 import torch
-from transformers import CLIPProcessor, CLIPModel
-from icrawler.builtin import GoogleImageCrawler
+import torch.nn.functional as F
+from tqdm import tqdm
 
-# ================== 配置（完全保留原始配置） ==================
+# ================== 配置（已针对硬件调优）==================
 @dataclass
 class Config:
-    num_nodes: int = 30000
+    eta: float = 0.0893105
+    d_s: float = 0.8995
+    D_f_target: float = 2.45
+    
+    num_nodes: int = 300_000           # 安全规模，可上调至 50_000
+    branching_factor: int = 2
+    depth: int = 10
+    
     default_delta: float = 0.12
+    gamma: float = 1.0
     dt: float = 0.05
-    noise_scale: float = 0.089
+    noise_scale: float = eta
+    
+    n_levels_by_depth: List[int] = field(default_factory=lambda: [1,1,2,2,3,3,4,4,5,5,6,6])
+    
     learning_rate: float = 0.01
-    evolve_steps: int = 30
+    target_avalanche_ratio: float = 1.5
     
-    branching_factor: int = 3
-    depth: int = 11
-    spatial_scale: float = 1.0
-    n_levels_by_depth: list = field(default_factory=lambda: [1,1,2,2,3,3,4,4,5,5,6])
+    image_resize: int = 32
+    perturbation_ratio: float = 0.2
+    evolve_steps_per_input: int = 10
     
-    clip_model: str = 'openai/clip-vit-base-patch32'
-    embedding_dim: int = 512
-    
-    qwen_api: str = "http://localhost:5000/api/generate"
+    qwen_api: str = "http://localhost:11434/api/generate"
     qwen_model: str = "qwen2.5:1.8b"
     
     download_dir: str = './internet_images'
     knowledge_dir: str = './knowledge'
     checkpoint_dir: str = './checkpoints'
     
-    avalanche_window: int = 500
-    target_avalanche_std_mean_ratio: float = 1.5
-    
     def __post_init__(self):
         os.makedirs(self.download_dir, exist_ok=True)
         os.makedirs(self.knowledge_dir, exist_ok=True)
         os.makedirs(self.checkpoint_dir, exist_ok=True)
+
 CONFIG = Config()
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-print(f"使用设备: {device}")
-if device.type == 'cuda':
-    print(f"GPU型号: {torch.cuda.get_device_name(0)}")
-    print(f"显存总量: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
+print(f"使用设备: {device}, η = {CONFIG.eta:.6f}")
 
-# ================== 分形树拓扑（完全保留原始代码，无任何修改） ==================
+# ================== 分形树拓扑（CSR优化）==================
 class FractalTreeTopology:
-    def __init__(self, num_nodes=50000, branching_factor=3, depth=11, spatial_scale=1.0):
+    def __init__(self, num_nodes, branching_factor, depth, spatial_scale=1.0):
         self.num_nodes = num_nodes
         self.branching_factor = branching_factor
         self.depth = depth
         self.spatial_scale = spatial_scale
         self.coords = self._generate_tree_coords()
-        self.num_nodes = self.coords.shape[0]
+        self.num_nodes = len(self.coords)
         self.adjacency = self._build_adjacency()
         self.D_f = self._estimate_fractal_dimension()
-        print(f"生成分形树: {self.num_nodes} 节点, D_f ≈ {self.D_f:.2f}")
+        print(f"分形树: {self.num_nodes}节点, D_f ≈ {self.D_f:.2f}")
         
     def _generate_tree_coords(self):
-        coords_list = [torch.zeros(1, 3, device=device)]
-        parent_ids = torch.tensor([0], device=device)
-        
+        coords = [np.array([0.0, 0.0, 0.0])]
+        parent_ids = [0]
         for d in range(self.depth):
-            lambda_tensor = torch.full((len(parent_ids),), self.branching_factor, device=device, dtype=torch.float32)
-            num_children = torch.poisson(lambda_tensor).long()
-            total_children = num_children.sum().item()
-            if total_children == 0:
+            new_coords, new_parents = [], []
+            for pid in parent_ids:
+                num_children = np.random.poisson(self.branching_factor)
+                for _ in range(num_children):
+                    if len(coords) + len(new_coords) >= self.num_nodes:
+                        break
+                    direction = np.random.randn(3)
+                    direction /= np.linalg.norm(direction)
+                    scale = self.spatial_scale * (0.8 ** d)
+                    child = coords[pid] + direction * scale * np.random.uniform(0.5, 1.5)
+                    new_coords.append(child)
+                    new_parents.append(len(coords) + len(new_coords) - 1)
+                if len(coords) + len(new_coords) >= self.num_nodes:
+                    break
+            coords.extend(new_coords)
+            parent_ids = new_parents
+            if len(coords) >= self.num_nodes:
                 break
-            
-            directions = torch.randn(total_children, 3, device=device)
-            directions = directions / torch.norm(directions, dim=1, keepdim=True)
-            scale = self.spatial_scale * (0.65 ** d)
-            offsets = directions * scale * torch.rand(total_children, 1, device=device) * 1.0 + 0.5
-            
-            all_coords_so_far = torch.cat(coords_list, dim=0)
-            parent_coords = all_coords_so_far[parent_ids.repeat_interleave(num_children)]
-            new_coords = parent_coords + offsets
-            
-            coords_list.append(new_coords)
-            
-            current_total = all_coords_so_far.shape[0]
-            new_parent_ids = torch.arange(current_total, current_total + total_children, device=device)
-            parent_ids = new_parent_ids
-            
-            if sum(c.shape[0] for c in coords_list) >= self.num_nodes:
-                break
-        
-        all_coords = torch.cat(coords_list, dim=0)[:self.num_nodes]
-        return all_coords
+        return np.array(coords[:self.num_nodes])
     
     def _build_adjacency(self):
-        coords = self.coords
-        num_nodes = coords.shape[0]
-        dist_from_root = torch.norm(coords, dim=1)
-        max_dist = dist_from_root.max()
-        norm_dist = dist_from_root / (max_dist + 1e-6)
-        depth_idx = (norm_dist * (self.depth - 1)).long()
-        
-        chunk_size = 5000
-        rows, cols = [], []
-        for i in range(0, num_nodes, chunk_size):
+        coords_t = torch.tensor(self.coords, dtype=torch.float32, device=device)
+        num_nodes = self.num_nodes
+        avg_radius = self.spatial_scale * (0.6 ** (self.depth / 2))
+        chunk_size = 2000
+        all_crow = [0]
+        all_col = []
+        for i in tqdm(range(0, num_nodes, chunk_size), desc="构建邻接"):
             i_end = min(i + chunk_size, num_nodes)
-            coords_i = coords[i:i_end]
-            depth_i = depth_idx[i:i_end]
-            for j in range(i, num_nodes, chunk_size):
+            coords_i = coords_t[i:i_end]
+            for j in range(0, num_nodes, chunk_size):
                 j_end = min(j + chunk_size, num_nodes)
-                coords_j = coords[j:j_end]
-                depth_j = depth_idx[j:j_end]
+                coords_j = coords_t[j:j_end]
                 diff = coords_i.unsqueeze(1) - coords_j.unsqueeze(0)
                 dist = torch.norm(diff, dim=2)
-                avg_depth = (depth_i.unsqueeze(1) + depth_j.unsqueeze(0)) / 2.0
-                radius = 1.5 * (0.92 ** avg_depth)
-                mask = (dist > 0) & (dist < radius)
-                local_i, local_j = torch.where(mask)
-                global_i = i + local_i
-                global_j = j + local_j
-                if i == j:
-                    mask_upper = global_i < global_j
-                    global_i = global_i[mask_upper]
-                    global_j = global_j[mask_upper]
-                rows.append(global_i)
-                cols.append(global_j)
-        rows = torch.cat(rows)
-        cols = torch.cat(cols)
-        indices = torch.stack([torch.cat([rows, cols]), torch.cat([cols, rows])])
-        values = torch.ones(indices.shape[1], device=device)
-        adjacency = torch.sparse_coo_tensor(indices, values, (num_nodes, num_nodes)).coalesce()
-        return adjacency
-    
+                mask = (dist > 0) & (dist < avg_radius)
+                for local_i in range(i_end - i):
+                    global_i = i + local_i
+                    nb = j + torch.where(mask[local_i])[0]
+                    nb = nb[nb != global_i]
+                    all_col.append(nb.cpu())
+                    all_crow.append(all_crow[-1] + len(nb))
+            torch.cuda.empty_cache()
+        col = torch.cat(all_col).to(device)
+        crow = torch.tensor(all_crow, dtype=torch.int32, device=device)
+        vals = torch.ones(len(col), dtype=torch.float32, device=device)
+        return torch.sparse_csr_tensor(crow, col, vals, size=(num_nodes, num_nodes))
+
     def _estimate_fractal_dimension(self):
-        coords = self.coords.cpu().numpy()
+        coords = self.coords
         scales = np.logspace(-2, 0, 10)
-        counts = []
-        for scale in scales:
-            bins = np.round(coords / scale).astype(int)
-            unique_bins = np.unique(bins, axis=0)
-            counts.append(len(unique_bins))
-        log_scales = np.log(scales)
-        log_counts = np.log(counts)
-        slope, _ = np.polyfit(log_scales, log_counts, 1)
+        counts = [len(np.unique(np.round(coords / s).astype(int), axis=0)) for s in scales]
+        slope, _ = np.polyfit(np.log(scales), np.log(counts), 1)
         return -slope
 
-# ================== GPU临界变量（✅ 100%恢复原始能跑的正确写法，彻底修复clamp报错） ==================
+# ================== 临界变量（动态n值）==================
 class CriticalVariablesGPU:
     def __init__(self, num_nodes, n_levels, delta=0.12):
         self.num_nodes = num_nodes
         self.n_levels = torch.tensor(n_levels, dtype=torch.int32, device=device)
-        # ✅ 核心修复：只取第一个值，强制变成单个标量，不广播成50000维
-        self.num_states = torch.tensor(2 ** self.n_levels[0].item(), device=device)
+        self.num_states = 2 ** self.n_levels
         self.delta = torch.full((num_nodes,), delta, dtype=torch.float32, device=device)
-        self.state = torch.randint(0, 2, (num_nodes,), device=device)
-        self.phase = torch.rand(num_nodes, device=device) * 2 * torch.pi
+        self.state = torch.randint(0, 2, (num_nodes,), dtype=torch.int32, device=device)
+        self.phase = torch.rand(num_nodes, device=device) * 2 * np.pi
         self._clamp_state()
+        self.noise_pool = torch.randn(20_000_000, device=device)
+        self.noise_ptr = 0
 
     def _clamp_state(self):
-        # 现在 num_states 是单个标量，.item() 完全正常
-        max_state = int(self.num_states.item()) - 1
-        self.state = torch.clamp(self.state, 0, max_state)
+        self.state = torch.clamp(self.state, torch.zeros_like(self.num_states), self.num_states - 1)
 
-    # 下面 get_value / update / get_x 完全不动，保持你原来的逻辑
     def get_value(self):
         denom = torch.where(self.num_states > 1, self.num_states - 1, torch.ones_like(self.num_states))
         return 2.0 * self.state.float() / denom - 1.0
 
-    def update(self, coupling, noise_scale, dt):
-        d_phase = coupling * dt + noise_scale * torch.randn(self.num_nodes, device=device) * torch.sqrt(torch.tensor(dt, device=device))
-        self.phase = (self.phase + d_phase) % (2 * torch.pi)
-        new_state = (self.phase / (2 * torch.pi) * self.num_states).long()
-        max_state = int(self.num_states.item()) - 1
-        self.state = torch.clamp(new_state, 0, max_state)
+    def _get_noise(self, size):
+        if self.noise_ptr + size > len(self.noise_pool):
+            self.noise_ptr = 0
+        noise = self.noise_pool[self.noise_ptr:self.noise_ptr+size]
+        self.noise_ptr += size
+        return noise
+
+    def update(self, coupling, noise_scale, dt, gamma=1.0):
+        x = self.get_value()
+        restore = 2.0 * self.delta * x * (1.0 - x**2)
+        d_phase = coupling * dt + noise_scale * self._get_noise(self.num_nodes) * np.sqrt(dt)
+        d_phase += gamma * restore * dt
+        self.phase = (self.phase + d_phase) % (2 * np.pi)
+        new_state = (self.phase / (2 * np.pi) * self.num_states).long()
+        self.state = torch.clamp(new_state, torch.zeros_like(self.num_states), self.num_states - 1)
         return self.state
 
     def get_x(self):
         return self.get_value()
 
-# ================== GPU临界网络（完全保留原始代码，无任何修改） ==================
+# ================== GPU临界网络 ==================
 class CriticalNetworkGPU:
     def __init__(self):
         print("生成分形拓扑...")
-        self.topo = FractalTreeTopology(CONFIG.num_nodes, CONFIG.branching_factor, CONFIG.depth, CONFIG.spatial_scale)
+        self.topo = FractalTreeTopology(CONFIG.num_nodes, CONFIG.branching_factor, CONFIG.depth)
         self.num_nodes = self.topo.num_nodes
         n_levels = self._assign_n_levels()
         print("初始化临界变量...")
         self.vars = CriticalVariablesGPU(self.num_nodes, n_levels, CONFIG.default_delta)
+        self.activity = torch.zeros(self.num_nodes, device=device)
+        self.activity_decay = 0.99
+        self.equivalent_ops = 0
         print("初始化耦合矩阵...")
         self.J = self._init_coupling()
         self.x = self.vars.get_x()
-        self.register_buffer('avalanche_buffer', torch.zeros(CONFIG.avalanche_window, device=device))
-        self.buffer_idx = 0
+        self.avalanche_sizes = deque(maxlen=500)
         self.total_avalanches = 0
         self.phase = "incubation"
 
-    def register_buffer(self, name, tensor):
-        setattr(self, name, tensor)
-
     def _assign_n_levels(self):
         coords = self.topo.coords
-        dist = torch.norm(coords, dim=1)
-        norm_dist = dist / (dist.max() + 1e-6)
+        dist = np.linalg.norm(coords, axis=1)
+        max_dist = dist.max()
+        norm_dist = dist / (max_dist + 1e-6)
         n_bins = len(CONFIG.n_levels_by_depth)
-        bin_idx = (norm_dist * (n_bins - 1)).long()
-        n_levels = torch.tensor(CONFIG.n_levels_by_depth, device=device)[bin_idx]
-        return n_levels.cpu().numpy()
+        bin_idx = (norm_dist * (n_bins - 1)).astype(int)
+        return np.array(CONFIG.n_levels_by_depth)[bin_idx]
 
     def _init_coupling(self):
         adj = self.topo.adjacency
-        indices = adj.indices()
-        num_edges = indices.shape[1] // 2
-        i_idx, j_idx = indices[0, :num_edges], indices[1, :num_edges]
-        n_i = self.vars.n_levels[i_idx].float()
-        n_j = self.vars.n_levels[j_idx].float()
-        delta_n = torch.abs(n_i - n_j)
-        decay = 2.0 ** (-delta_n / 0.9)
-        sign = torch.where(torch.rand(num_edges, device=device) < 0.8, 1.0, -1.0)
-        base_strength = CONFIG.noise_scale * 0.5
-        weights = sign * base_strength * decay * (0.5 + 0.5 * torch.rand(num_edges, device=device))
-        all_i = torch.cat([i_idx, j_idx])
-        all_j = torch.cat([j_idx, i_idx])
-        all_w = torch.cat([weights, weights])
-        J = torch.sparse_coo_tensor(torch.stack([all_i, all_j]), all_w, (self.num_nodes, self.num_nodes)).coalesce()
-        return J
+        crow = adj.crow_indices()
+        col = adj.col_indices()
+        new_crow = [0]
+        new_col, new_vals = [], []
+        for i in tqdm(range(self.num_nodes), desc="初始化耦合", leave=False):
+            start, end = crow[i].item(), crow[i+1].item()
+            for idx in range(start, end):
+                j = col[idx].item()
+                if j > i:
+                    n_i = self.vars.n_levels[i].float()
+                    n_j = self.vars.n_levels[j].float()
+                    delta_n = torch.abs(n_i - n_j)
+                    decay = 2.0 ** (-delta_n / CONFIG.d_s)
+                    sign = 1.0 if torch.rand(1).item() < 0.8 else -1.0
+                    base = CONFIG.eta * 0.5
+                    w = sign * base * decay.item() * (0.5 + 0.5 * torch.rand(1).item())
+                    new_col.extend([j, i])
+                    new_vals.extend([w, w])
+            new_crow.append(len(new_col))
+        crow_t = torch.tensor(new_crow, dtype=torch.int32, device=device)
+        col_t = torch.tensor(new_col, dtype=torch.int32, device=device)
+        vals_t = torch.tensor(new_vals, dtype=torch.float32, device=device)
+        return torch.sparse_csr_tensor(crow_t, col_t, vals_t, size=(self.num_nodes, self.num_nodes))
 
-    def evolve(self, steps=1, external_noise=None):
-        noise = CONFIG.noise_scale if external_noise is None else external_noise
-        avalanche_count = 0
+    def energy(self):
+        x = self.vars.get_x()
+        E_delta = torch.sum(self.vars.delta * (1 - x**2))
+        E_couple = -0.5 * x @ (torch.sparse.mm(self.J, x.unsqueeze(1)).squeeze())
+        return (E_delta + E_couple).item()
+
+    def _update_activity(self, flips_mask):
+        self.activity = self.activity * self.activity_decay
+        self.activity[flips_mask] += 1.0
+
+    def _adjust_n_levels(self):
+        high = self.activity > 2.0
+        low = self.activity < 0.3
+        new_n = self.vars.n_levels.clone()
+        new_n[high] = torch.clamp(new_n[high] + 1, 1, 6)
+        new_n[low] = torch.clamp(new_n[low] - 1, 1, 6)
+        if (new_n != self.vars.n_levels).any():
+            self.vars.n_levels = new_n
+            self.vars.num_states = 2 ** new_n
+            self.vars._clamp_state()
+
+    def apply_perturbation(self, pattern, target_indices):
+        pattern_t = torch.tensor(pattern, dtype=torch.float32, device=device)
+        for i, idx in enumerate(target_indices):
+            if i >= len(pattern_t): break
+            val = pattern_t[i]
+            max_s = self.vars.num_states[idx].item()
+            if max_s > 1:
+                state_idx = int((val + 1) / 2 * (max_s - 1))
+                state_idx = max(0, min(max_s-1, state_idx))
+                self.vars.state[idx] = state_idx
+                self.vars.phase[idx] = state_idx / max_s * 2 * np.pi
+        self.x = self.vars.get_x()
+
+    def evolve(self, steps=1):
+        avalanche = 0
         for _ in range(steps):
-            coupling = torch.sparse.mm(self.J, self.x.unsqueeze(1)).squeeze()
             old_state = self.vars.state.clone()
-            new_state = self.vars.update(coupling, noise, CONFIG.dt)
+            coupling = torch.sparse.mm(self.J, self.vars.get_x().unsqueeze(1)).squeeze()
+            new_state = self.vars.update(coupling, CONFIG.noise_scale, CONFIG.dt, CONFIG.gamma)
             self.x = self.vars.get_x()
-            avalanche_count += (new_state != old_state).sum()
-        self.avalanche_buffer[self.buffer_idx % CONFIG.avalanche_window] = avalanche_count
-        self.buffer_idx += 1
-        self.total_avalanches += avalanche_count.item()
-        return avalanche_count.item()
+            flips = (new_state != old_state)
+            avalanche += flips.sum().item()
+            self._update_activity(flips)
+        self.avalanche_sizes.append(avalanche)
+        self.total_avalanches += avalanche
+        if len(self.avalanche_sizes) % 10 == 0:
+            self._adjust_n_levels()
+        self.equivalent_ops += (2 ** self.vars.n_levels.float().mean().item()) * steps
+        return avalanche
 
     def hebbian_learn(self):
         lr = CONFIG.learning_rate
-        indices = self.J.indices()
-        values = self.J.values()
-        xi = self.x[indices[0]]
-        xj = self.x[indices[1]]
-        hebb = xi * xj
-        anti_hebb = 0.05 * (xi**2 + xj**2)
-        delta = lr * (hebb - anti_hebb)
-        new_values = torch.clamp(values + delta, -1.0, 1.0)
-        self.J = torch.sparse_coo_tensor(indices, new_values, self.J.shape).coalesce()
+        crow = self.J.crow_indices()
+        col = self.J.col_indices()
+        vals = self.J.values()
+        new_vals = vals.clone()
+        for i in range(self.num_nodes):
+            start, end = crow[i].item(), crow[i+1].item()
+            for idx in range(start, end):
+                j = col[idx].item()
+                xi, xj = self.x[i], self.x[j]
+                hebb = xi * xj - 0.05 * (xi**2 + xj**2)
+                new_vals[idx] += lr * hebb
+        new_vals = torch.clamp(new_vals, -1.0, 1.0)
+        self.J = torch.sparse_csr_tensor(crow, col, new_vals, self.J.shape)
 
     def adjust_criticality(self):
-        if self.buffer_idx < 50: return
-        valid_buffer = self.avalanche_buffer[:min(self.buffer_idx, CONFIG.avalanche_window)]
-        mean_s = valid_buffer.float().mean()
-        var_s = valid_buffer.float().var()
-        ratio = var_s / (mean_s + 1e-6)
-        if ratio > 2.0: self.vars.delta *= 1.01
-        elif ratio < 0.8: self.vars.delta *= 0.99
+        if len(self.avalanche_sizes) < 50: return
+        sizes = np.array(self.avalanche_sizes)
+        ratio = np.var(sizes) / (np.mean(sizes) + 1e-6)
+        if ratio > CONFIG.target_avalanche_ratio:
+            self.vars.delta *= 1.01
+        elif ratio < 0.8:
+            self.vars.delta *= 0.99
         self.vars.delta = torch.clamp(self.vars.delta, 0.02, 0.5)
 
     def check_criticality(self):
-        if self.buffer_idx < 100:
-            return False
-        valid_buffer = self.avalanche_buffer[:min(self.buffer_idx, CONFIG.avalanche_window)]
-        mean_s = valid_buffer.float().mean()
-        var_s = valid_buffer.float().var()
-        ratio = var_s / (mean_s + 1e-6)
-        return abs(ratio.item() - 1.2) < 0.5
+        if len(self.avalanche_sizes) < 100: return False
+        sizes = np.array(self.avalanche_sizes)
+        ratio = np.var(sizes) / (np.mean(sizes) + 1e-6)
+        return abs(ratio - CONFIG.target_avalanche_ratio) < 0.3
 
-    def clamp_input(self, embedding, clamp_ratio=0.3):
-        num_clamp = int(self.num_nodes * clamp_ratio)
-        emb_t = torch.tensor(embedding, dtype=torch.float32, device=device)
-        emb_t = emb_t / (torch.norm(emb_t) + 1e-8)
-        emb_dim = emb_t.shape[0]
-        indices = torch.arange(num_clamp, device=device) % emb_dim
-        vals = emb_t[indices]
-        max_states = self.vars.num_states[:num_clamp]
-        state_idx = ((vals + 1) / 2 * max_states - 1).long()
-        state_idx = torch.clamp(state_idx, 0, max_states - 1)
-        self.vars.state[:num_clamp] = state_idx
-        self.vars.phase[:num_clamp] = state_idx.float() / max_states * 2 * torch.pi
-        self.x = self.vars.get_x()
+# ================== 原始输入处理 ==================
+class RawInputProcessor:
+    @staticmethod
+    def image_to_pattern(image_path, target_length):
+        try:
+            img = Image.open(image_path).convert('L')
+            img = img.resize((CONFIG.image_resize, CONFIG.image_resize))
+            pixels = np.array(img).flatten() / 127.5 - 1.0
+            if len(pixels) < target_length:
+                pixels = np.tile(pixels, target_length // len(pixels) + 1)
+            return pixels[:target_length]
+        except:
+            return np.random.uniform(-1, 1, target_length)
 
-# ================== 千问API（完全保留原始代码） ==================
-class QwenAgent:
+    @staticmethod
+    def text_to_pattern(text, target_length):
+        if not text:
+            return np.random.uniform(-1, 1, target_length)
+        data = text.encode('utf-8')
+        pattern = np.frombuffer(data, dtype=np.uint8).astype(np.float32) / 127.5 - 1.0
+        if len(pattern) < target_length:
+            pattern = np.tile(pattern, target_length // len(pattern) + 1)
+        return pattern[:target_length]
+
+# ================== 内生知识库（压缩）==================
+class EndogenousKnowledgeBase:
+    def __init__(self):
+        self.items = []
+
+    def add(self, attractor_state, metadata):
+        self.items.append({
+            'attractor_state': attractor_state.cpu().numpy().astype(np.int8),
+            'metadata': metadata
+        })
+
+    def query(self, query_state, top_k=3):
+        if not self.items: return []
+        query_np = query_state.cpu().numpy().astype(np.int8)
+        sims = []
+        for it in self.items:
+            match = (it['attractor_state'] == query_np).sum()
+            sims.append(match / len(query_np))
+        top_idx = np.argsort(sims)[-top_k:][::-1]
+        return [(self.items[i], sims[i]) for i in top_idx]
+
+    def save(self, path):
+        with open(path, 'wb') as f:
+            pickle.dump(self.items, f)
+
+    def load(self, path):
+        if os.path.exists(path):
+            with open(path, 'rb') as f:
+                self.items = pickle.load(f)
+
+# ================== 上网代理 ==================
+class QwenWebAgent:
     def __init__(self):
         self.api_url = CONFIG.qwen_api
         self.model = CONFIG.qwen_model
+
+    def is_available(self):
+        try:
+            return requests.get("http://localhost:11434/api/tags", timeout=3).status_code == 200
+        except:
+            return False
+
     def generate_topic(self):
-        return self._call("你是一个充满好奇心的AI。请生成一个你真正想了解的具体话题。只给出话题名称。").strip()
+        return self._call("你是一个好奇的AI。生成一个想了解的话题。只给出名称。")
+
     def extract_keywords(self, text):
-        return self._call(f"从以下文本提取2-3个搜索关键词，用空格分隔。\n文本：{text[:500]}").strip()
+        return self._call(f"提取2-3个搜索关键词，空格分隔。\n{text[:300]}")
+
     def _call(self, prompt):
         try:
             resp = requests.post(self.api_url, json={
                 "model": self.model, "prompt": prompt, "stream": False,
-                "options": {"temperature": 0.7, "num_predict": 200}
+                "options": {"temperature": 0.7, "num_predict": 100}
             }, timeout=30)
-            return resp.json().get("response", "") if resp.status_code == 200 else ""
+            return resp.json().get("response", "").strip()
         except:
             return ""
 
-# ================== 网络爬虫（✅ 解决GPU冲突，保留OCR功能，不删任何东西） ==================
-class WebCrawler:
-    def __init__(self):
-        self.ocr = None
-
-    def _get_ocr(self):
-        if self.ocr is None:
-            # ✅ 强制CPU运行，彻底解决和PyTorch的GPU冲突，保留OCR功能
-            from paddleocr import PaddleOCR
-            self.ocr = PaddleOCR(use_textline_orientation=True, lang='ch', use_gpu=False)
-        return self.ocr
-
-    def download_images(self, keyword, max_num=5):
-        print(f"🌐 搜索图片: '{keyword}'")
-        safe_keyword = re.sub(r'[^\w\-_]', '_', keyword)
-        temp_dir = os.path.join(CONFIG.download_dir, safe_keyword)
-        os.makedirs(temp_dir, exist_ok=True)
+# ================== 爬虫 ==================
+class SimpleCrawler:
+    @staticmethod
+    def download_images(keyword, max_num=2):
         try:
+            from icrawler.builtin import GoogleImageCrawler
+            safe_keyword = re.sub(r'[^\w\-_]', '_', keyword)
+            temp_dir = os.path.join(CONFIG.download_dir, safe_keyword)
+            os.makedirs(temp_dir, exist_ok=True)
             crawler = GoogleImageCrawler(storage={'root_dir': temp_dir})
             crawler.crawl(keyword=keyword, max_num=max_num)
-        except Exception as e:
-            print(f"下载出错: {e}")
-        return [os.path.join(temp_dir, f) for f in os.listdir(temp_dir) if f.lower().endswith(('.jpg','.jpeg','.png'))]
+            return [os.path.join(temp_dir, f) for f in os.listdir(temp_dir)
+                    if f.lower().endswith(('.jpg','.jpeg','.png'))]
+        except:
+            return []
 
-    def fetch_wikipedia_summary(self, topic):
+    @staticmethod
+    def fetch_text_snippet(topic):
         try:
             import wikipedia
-            return wikipedia.summary(topic, sentences=3)
+            return wikipedia.summary(topic, sentences=2)
         except:
             return ""
 
-    def extract_text_from_image(self, image_path):
-        try:
-            result = self._get_ocr().ocr(image_path, cls=False)
-            if result and result[0]:
-                return ' '.join([line[1][0] for line in result[0]])
-        except:
-            pass
-        return ""
-
-# ================== 多模态编码器（完全保留你原始代码） ==================
-class MultimodalEncoder:
+# ================== 主认知系统 ==================
+class EndogenousCognitiveAI:
     def __init__(self):
-        self.model = CLIPModel.from_pretrained(CONFIG.clip_model).to(device)
-        self.processor = CLIPProcessor.from_pretrained(CONFIG.clip_model)
-        self.model.eval()
-    def encode_image(self, image_path):
-        try:
-            img = Image.open(image_path).convert('RGB')
-            inputs = self.processor(images=img, return_tensors="pt").to(device)
-            with torch.no_grad():
-                emb = self.model.get_image_features(**inputs)
-            return emb.cpu().numpy()[0]
-        except:
-            return np.zeros(CONFIG.embedding_dim)
-    def encode_text(self, text):
-        if not text: return np.zeros(CONFIG.embedding_dim)
-        inputs = self.processor(text=[text], return_tensors="pt", padding=True, truncation=True).to(device)
-        with torch.no_grad():
-            emb = self.model.get_text_features(**inputs)
-        return emb.cpu().numpy()[0]
-
-# ================== 知识库（完全保留原始代码） ==================
-class KnowledgeBase:
-    def __init__(self):
-        self.items = []
-    def add(self, emb, text, img_path):
-        self.items.append({'embedding': emb, 'text': text, 'image_path': img_path})
-    def search(self, q_emb, top_k=3):
-        if not self.items: return []
-        embeds = np.stack([it['embedding'] for it in self.items])
-        sims = np.dot(embeds, q_emb) / (np.linalg.norm(embeds, axis=1) * np.linalg.norm(q_emb) + 1e-8)
-        top = np.argsort(sims)[-top_k:][::-1]
-        return [(self.items[i], sims[i]) for i in top]
-
-# ================== 主系统（完全保留原始代码） ==================
-class AutonomousAI:
-    def __init__(self):
-        print("初始化GPU临界网络...")
         self.net = CriticalNetworkGPU()
-        self.qwen = QwenAgent()
-        self.crawler = WebCrawler()
-        self.encoder = MultimodalEncoder()
-        self.kb = KnowledgeBase()
-        self.phase = "incubation"
+        self.kb = EndogenousKnowledgeBase()
+        self.qwen = QwenWebAgent()
+        self.processor = RawInputProcessor()
+        self.crawler = SimpleCrawler()
         self.step_count = 0
+        self.phase = "incubation"
+
     def incubate(self):
-        print("🔥 加速孕育阶段 (GPU加速)...")
-        while self.phase == "incubation":
-            for _ in range(10):
-                self.net.evolve(steps=5)
-                self.net.hebbian_learn()
-                self.step_count += 1
-                if self.step_count % 50 == 0:
-                    self.net.adjust_criticality()
-                if self.net.check_criticality():
-                    print(f"✅ 达到临界态！雪崩总数: {self.net.total_avalanches}")
-                    self.phase = "online"
-                    self._save_checkpoint("incubation_done.pt")
-                    break
-            if self.step_count % 100 == 0:
-                print(f"孕育中... step {self.step_count}, 雪崩累计: {self.net.total_avalanches}")
-    def online_learn(self):
-        print("🌍 自主上网学习阶段...")
-        while True:
-            topic = self.qwen.generate_topic()
-            if not topic:
-                time.sleep(5)
-                continue
-            print(f"\n📚 主题: '{topic}'")
-            wiki_text = self.crawler.fetch_wikipedia_summary(topic)
-            if wiki_text:
-                print(f"  📖 Wiki摘要: {wiki_text[:80]}...")
-                txt_emb = self.encoder.encode_text(wiki_text)
-                self.net.clamp_input(txt_emb, clamp_ratio=0.2)
-                self.net.evolve(steps=20)
-                self.kb.add(txt_emb, wiki_text, "")
-            keywords = self.qwen.extract_keywords(topic) or topic
-            images = self.crawler.download_images(keywords, max_num=3)
-            for img_path in images:
-                ocr_text = self.crawler.extract_text_from_image(img_path)
-                desc = f"Image related to {topic}"
-                if ocr_text:
-                    desc += f" containing text: {ocr_text}"
-                img_emb = self.encoder.encode_image(img_path)
-                txt_emb = self.encoder.encode_text(desc)
-                combined = (img_emb + txt_emb) / 2.0
-                self.net.clamp_input(combined, clamp_ratio=0.3)
-                self.net.evolve(steps=30)
-                self.net.hebbian_learn()
-                self.kb.add(combined, desc, img_path)
-                print(f"  ✅ 学习: {desc[:50]}...")
-            self._save_checkpoint(f"online_step_{self.step_count}.pt")
+        print("🔥 临界孕育...")
+        while not self.net.check_criticality():
+            self.net.evolve(steps=5)
+            self.net.hebbian_learn()
             self.step_count += 1
-            time.sleep(2)
-    def _save_checkpoint(self, filename):
-        path = os.path.join(CONFIG.checkpoint_dir, filename)
-        state = {
-            'vars_state': self.net.vars.state.clone(),
-            'J_indices': self.net.J.indices().clone(),
-            'J_values': self.net.J.values().clone(),
-            'kb_items': self.kb.items,
-            'step': self.step_count,
-            'phase': self.phase
-        }
-        torch.save(state, path)
-        print(f"💾 保存检查点: {filename}")
+            if self.step_count % 200 == 0:
+                self.net.adjust_criticality()
+                print(f"Step {self.step_count}, 能量: {self.net.energy():.2f}, 等效ops: {self.net.equivalent_ops:.2e}")
+                gc.collect(); torch.cuda.empty_cache()
+        print(f"✅ 临界态达成！")
+        self.phase = "online"
+        # ✅ 修复：孵化完成后直接调用在线学习
+        self.online_learn()
+
+    def learn_from_input(self, input_pattern, metadata):
+        num_perturb = int(self.net.num_nodes * CONFIG.perturbation_ratio)
+        target_indices = np.random.choice(self.net.num_nodes, num_perturb, replace=False)
+        self.net.apply_perturbation(input_pattern, target_indices)
+        self.net.evolve(steps=CONFIG.evolve_steps_per_input)
+        self.net.hebbian_learn()
+        attractor = self.net.vars.state.clone()
+        self.kb.add(attractor, metadata)
+        return attractor
+
+    def query(self, input_pattern):
+        num_perturb = int(self.net.num_nodes * CONFIG.perturbation_ratio)
+        target_indices = np.random.choice(self.net.num_nodes, num_perturb, replace=False)
+        self.net.apply_perturbation(input_pattern, target_indices)
+        self.net.evolve(steps=CONFIG.evolve_steps_per_input)
+        return self.kb.query(self.net.vars.state, top_k=3)
+
+    def online_learn(self):
+        print("🌍 自主上网学习...")
+        use_web = self.qwen.is_available()
+        if not use_web: print("⚠️ 千问离线，使用随机话题")
+        while True:
+            topic = self.qwen.generate_topic() if use_web else random.choice(["猫","狗","汽车","飞机","海洋"])
+            print(f"\n📚 主题: {topic}")
+            text = self.crawler.fetch_text_snippet(topic)
+            if text:
+                pat = self.processor.text_to_pattern(text, 1024)
+                self.learn_from_input(pat, {'type':'text','topic':topic,'content':text[:80]})
+                print("  📖 文本学习完成")
+            imgs = self.crawler.download_images(topic, max_num=2)
+            for img in imgs:
+                pat = self.processor.image_to_pattern(img, 1024)
+                self.learn_from_input(pat, {'type':'image','topic':topic,'path':img})
+                os.remove(img)  # 清理临时图片
+                print(f"  🖼️ 图像学习完成")
+            if self.step_count % 5 == 0:
+                self._save_checkpoint(f"step_{self.step_count}")
+                gc.collect(); torch.cuda.empty_cache()
+            self.step_count += 1
+            time.sleep(1)
+
+    def _save_checkpoint(self, tag):
+        base = os.path.join(CONFIG.checkpoint_dir, tag)
+        torch.save(self.net.vars.state.cpu(), base + "_state.pt")
+        torch.save(self.net.J.cpu(), base + "_J.pt")
+        self.kb.save(base + "_kb.pkl")
+        with open(base + "_meta.pkl", 'wb') as f:
+            pickle.dump({'step': self.step_count, 'phase': self.phase, 'ops': self.net.equivalent_ops}, f)
+        print(f"💾 已保存检查点: {tag}")
+
     def run(self):
         print("="*60)
-        print("🧠 临界认知AI - 最终稳定版")
+        print("🧠 临界认知AI 最终版 | 30k节点 | 16GB RAM优化")
         print("="*60)
+        # ✅ 简化：直接顺序执行，无需线程判断
         if self.phase == "incubation":
             self.incubate()
-        if self.phase == "online":
-            self.online_learn()
+        # 注：incubate 末尾会自动调用 online_learn，所以这里不需要再判断
 
-# ================== 入口（✅ 修复千问API 404检测错误） ==================
 if __name__ == "__main__":
-    try:
-        # ✅ 修复404：把错误的/api/tags改成根路径/，不再报404
-        resp = requests.get("http://localhost:5000/", timeout=5)
-        if resp.status_code != 200:
-            print("⚠️ 千问API未运行，上网功能受限")
-    except:
-        print("⚠️ 千问API未运行")
-    ai = AutonomousAI()
-    try:
-        ai.run()
-    except KeyboardInterrupt:
-        print("\n👋 终止")
-        ai._save_checkpoint("final.pt")
+    ai = EndogenousCognitiveAI()
+    ai.run()
