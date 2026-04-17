@@ -1,8 +1,9 @@
 """
-临界认知AI 最终优化版（修复临界后自动进入在线学习）
+临界认知AI 最终版（孵化自动进入学习 + 多地址千问探测）
 适配 16GB RAM + GTX 1660 (6GB)
 IDFT理论完整保留
 """
+
 import os, re, time, json, pickle, random, requests, threading, gc
 import numpy as np
 from collections import deque
@@ -13,14 +14,14 @@ import torch
 import torch.nn.functional as F
 from tqdm import tqdm
 
-# ================== 配置（已针对硬件调优）==================
+# ================== 配置 ==================
 @dataclass
 class Config:
     eta: float = 0.0893105
     d_s: float = 0.8995
     D_f_target: float = 2.45
     
-    num_nodes: int = 300_000           # 安全规模，可上调至 50_000
+    num_nodes: int = 30000
     branching_factor: int = 2
     depth: int = 10
     
@@ -38,7 +39,6 @@ class Config:
     perturbation_ratio: float = 0.2
     evolve_steps_per_input: int = 10
     
-    qwen_api: str = "http://localhost:11434/api/generate"
     qwen_model: str = "qwen2.5:1.8b"
     
     download_dir: str = './internet_images'
@@ -327,7 +327,7 @@ class RawInputProcessor:
             pattern = np.tile(pattern, target_length // len(pattern) + 1)
         return pattern[:target_length]
 
-# ================== 内生知识库（压缩）==================
+# ================== 内生知识库 ==================
 class EndogenousKnowledgeBase:
     def __init__(self):
         self.items = []
@@ -357,17 +357,34 @@ class EndogenousKnowledgeBase:
             with open(path, 'rb') as f:
                 self.items = pickle.load(f)
 
-# ================== 上网代理 ==================
+# ================== 上网代理（多地址自动探测）==================
 class QwenWebAgent:
     def __init__(self):
-        self.api_url = CONFIG.qwen_api
+        # ✅ 多地址列表，按优先级排序
+        self.potential_hosts = [
+            "http://127.0.0.1:5000",
+            "http://192.168.10.8:5000",
+            "http://localhost:11434",
+        ]
+        self.active_host = None
         self.model = CONFIG.qwen_model
 
+    def _find_active_host(self):
+        for host in self.potential_hosts:
+            try:
+                resp = requests.get(f"{host}/api/tags", timeout=2)
+                if resp.status_code == 200:
+                    print(f"✅ 成功连接到 Ollama 服务: {host}")
+                    return host
+            except:
+                continue
+        print("⚠️ 警告：无法连接到任何 Ollama 服务，将使用离线模式")
+        return None
+
     def is_available(self):
-        try:
-            return requests.get("http://localhost:11434/api/tags", timeout=3).status_code == 200
-        except:
-            return False
+        if self.active_host is None:
+            self.active_host = self._find_active_host()
+        return self.active_host is not None
 
     def generate_topic(self):
         return self._call("你是一个好奇的AI。生成一个想了解的话题。只给出名称。")
@@ -376,11 +393,19 @@ class QwenWebAgent:
         return self._call(f"提取2-3个搜索关键词，空格分隔。\n{text[:300]}")
 
     def _call(self, prompt):
+        if not self.is_available():
+            return ""
         try:
-            resp = requests.post(self.api_url, json={
-                "model": self.model, "prompt": prompt, "stream": False,
-                "options": {"temperature": 0.7, "num_predict": 100}
-            }, timeout=30)
+            resp = requests.post(
+                f"{self.active_host}/api/generate",
+                json={
+                    "model": self.model,
+                    "prompt": prompt,
+                    "stream": False,
+                    "options": {"temperature": 0.7, "num_predict": 100}
+                },
+                timeout=30
+            )
             return resp.json().get("response", "").strip()
         except:
             return ""
@@ -432,7 +457,6 @@ class EndogenousCognitiveAI:
                 gc.collect(); torch.cuda.empty_cache()
         print(f"✅ 临界态达成！")
         self.phase = "online"
-        # ✅ 修复：孵化完成后直接调用在线学习
         self.online_learn()
 
     def learn_from_input(self, input_pattern, metadata):
@@ -455,7 +479,8 @@ class EndogenousCognitiveAI:
     def online_learn(self):
         print("🌍 自主上网学习...")
         use_web = self.qwen.is_available()
-        if not use_web: print("⚠️ 千问离线，使用随机话题")
+        if not use_web:
+            print("⚠️ 千问离线，使用随机话题")
         while True:
             topic = self.qwen.generate_topic() if use_web else random.choice(["猫","狗","汽车","飞机","海洋"])
             print(f"\n📚 主题: {topic}")
@@ -468,7 +493,7 @@ class EndogenousCognitiveAI:
             for img in imgs:
                 pat = self.processor.image_to_pattern(img, 1024)
                 self.learn_from_input(pat, {'type':'image','topic':topic,'path':img})
-                os.remove(img)  # 清理临时图片
+                os.remove(img)
                 print(f"  🖼️ 图像学习完成")
             if self.step_count % 5 == 0:
                 self._save_checkpoint(f"step_{self.step_count}")
@@ -487,12 +512,11 @@ class EndogenousCognitiveAI:
 
     def run(self):
         print("="*60)
-        print("🧠 临界认知AI 最终版 | 30k节点 | 16GB RAM优化")
+        print("🧠 临界认知AI 最终版 | 30k节点 | 多地址千问探测")
         print("="*60)
-        # ✅ 简化：直接顺序执行，无需线程判断
         if self.phase == "incubation":
             self.incubate()
-        # 注：incubate 末尾会自动调用 online_learn，所以这里不需要再判断
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     ai = EndogenousCognitiveAI()
     ai.run()
