@@ -3,7 +3,6 @@
 适配 16GB RAM + GTX 1660 (6GB)
 IDFT理论完整保留
 """
-
 import os, re, time, json, pickle, random, requests, threading, gc
 import numpy as np
 from collections import deque
@@ -494,7 +493,6 @@ class EndogenousCognitiveAI:
         if self.phase == "incubation":
             self.incubate()
         # 注：incubate 末尾会自动调用 online_learn，所以这里不需要再判断
-
-if __name__ == "__main__":
+if __name__ == '__main__':
     ai = EndogenousCognitiveAI()
     ai.run()
